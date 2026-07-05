@@ -20,6 +20,9 @@ use crate::{
 pub const FROZEN_AFTER: Duration = Duration::from_secs(10);
 /// How many quiet ping-pong rounds mark a transition as complete.
 const QUIET_ROUNDS: u32 = 2;
+/// Minimum quiet period for waits involving X11 windows, which can't be
+/// pinged. Long enough to catch a typical redraw after injected input.
+const X11_SETTLE_GRACE: Duration = Duration::from_millis(400);
 
 #[derive(Debug)]
 pub struct PingState {
@@ -158,6 +161,19 @@ impl DesktopState {
         clients
     }
 
+    /// Whether any window relevant to this wait is an X11 window. X11 clients
+    /// don't answer xdg pings, so the ping-round rule can complete before the
+    /// app has reacted; such waits get a minimum settle grace instead.
+    fn wait_involves_x11(&self, watch: Option<u64>, known_at_start: &HashSet<u64>) -> bool {
+        self.windows.iter().any(|(id, window)| {
+            let relevant = match watch {
+                None => true,
+                Some(watched) => *id == watched || !known_at_start.contains(id),
+            };
+            relevant && window.is_x11()
+        })
+    }
+
     /// Send a ping to the given shell client unless one is already in flight.
     fn ensure_ping(&mut self, sc: &ShellClient) -> Option<u64> {
         let key = shell_client_key(sc)?;
@@ -209,6 +225,13 @@ impl DesktopState {
     fn evaluate_waits(&mut self) {
         let now = Instant::now();
         let current_ids: HashSet<u64> = self.windows.keys().copied().collect();
+        // Precompute X11 involvement per wait (borrow of self ends before the
+        // mutable loop below).
+        let x11_involved: Vec<bool> = self
+            .waits
+            .iter()
+            .map(|w| self.wait_involves_x11(w.watch, &w.known_at_start))
+            .collect();
         let mut finished: Vec<(usize, bool)> = Vec::new();
         for (i, wait) in self.waits.iter_mut().enumerate() {
             if now >= wait.deadline {
@@ -245,7 +268,12 @@ impl DesktopState {
                                 && wait.last_activity.elapsed() >= quiet_time
                         }
                     };
-                    if settled {
+                    // X11 windows can't be pinged, so give them a grace period
+                    // after the last update (or after the action, if they never
+                    // reacted) before considering the transition complete.
+                    let grace_ok = !x11_involved[i]
+                        || wait.last_activity.elapsed() >= X11_SETTLE_GRACE;
+                    if settled && grace_ok {
                         finished.push((i, false));
                     }
                 }

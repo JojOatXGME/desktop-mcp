@@ -633,14 +633,15 @@ impl DesktopMcp {
         params: Parameters<LaunchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let p = params.0;
+        // tokio reaps the child in the background once it exits.
         let mut cmd = match &p.args {
             Some(args) => {
-                let mut c = std::process::Command::new(&p.command);
+                let mut c = tokio::process::Command::new(&p.command);
                 c.args(args);
                 c
             }
             None => {
-                let mut c = std::process::Command::new("sh");
+                let mut c = tokio::process::Command::new("sh");
                 c.arg("-c").arg(&p.command);
                 c
             }

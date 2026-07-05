@@ -14,7 +14,7 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 rmcp = { version = "2.1.0", features = ["server", "transport-streamable-http-server"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-smithay = { version = "0.7.0", default-features = false, features = ["desktop", "renderer_pixman", "wayland_frontend"] }
+smithay = { version = "0.7.0", default-features = false, features = ["desktop", "renderer_pixman", "wayland_frontend", "xwayland"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

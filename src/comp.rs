@@ -16,8 +16,8 @@ use smithay::{
         damage::OutputDamageTracker, pixman::PixmanRenderer, utils::on_commit_buffer_handler,
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
-    desktop::{find_popup_root_surface, PopupKind, PopupManager, Space, Window},
+    delegate_xdg_shell, delegate_xwayland_shell,
+    desktop::{find_popup_root_surface, PopupKind, PopupManager, Space, Window, WindowSurface},
     input::{
         keyboard::{FilterResult, Keycode, XkbConfig},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
@@ -52,6 +52,11 @@ use smithay::{
             XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
+        xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
+    },
+    xwayland::{
+        xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmId},
+        X11Surface, X11Wm, XwmHandler,
     },
 };
 
@@ -95,6 +100,10 @@ pub struct DesktopState {
 
     pub ping_states: HashMap<u64, PingState>,
     pub waits: Vec<Wait>,
+
+    pub xwayland_shell_state: XWaylandShellState,
+    pub xwm: Option<X11Wm>,
+    pub xdisplay: Option<u32>,
 }
 
 /// Tag stored in each Window's user data to identify it across the API.
@@ -136,6 +145,7 @@ impl DesktopState {
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
 
         let mut seat: Seat<Self> = seat_state.new_wl_seat(dh, "desktop-mcp");
         // Pin the layout explicitly: XkbConfig::default() would fall back to
@@ -205,6 +215,9 @@ impl DesktopState {
             focused_window: None,
             ping_states: HashMap::new(),
             waits: Vec::new(),
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
         })
     }
 
@@ -217,14 +230,48 @@ impl DesktopState {
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        use smithay::wayland::seat::WaylandFocus;
         self.space
             .elements()
-            .find(|w| {
-                w.toplevel()
-                    .map(|t| t.wl_surface() == surface)
-                    .unwrap_or(false)
-            })
+            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
             .cloned()
+    }
+
+    pub fn window_for_x11(&self, surface: &X11Surface) -> Option<Window> {
+        self.windows
+            .values()
+            .find(|w| w.x11_surface() == Some(surface))
+            .cloned()
+    }
+
+    /// Register a window under a fresh id and map it into the space.
+    fn register_window(&mut self, window: Window, loc: Point<i32, Logical>, activate: bool) -> u64 {
+        let id = self.next_window_id;
+        self.next_window_id += 1;
+        window.user_data().insert_if_missing(|| WindowIdTag(id));
+        self.space.map_element(window.clone(), loc, activate);
+        self.windows.insert(id, window);
+        self.note_window_activity(id);
+        id
+    }
+
+    fn unregister_window(&mut self, id: u64) {
+        if let Some(window) = self.windows.remove(&id) {
+            self.space.unmap_elem(&window);
+        }
+        self.note_window_closed(id);
+        if self.focused_window == Some(id) {
+            self.focused_window = None;
+            let top = self.space.elements().last().and_then(Self::window_id);
+            if let Some(top) = top {
+                let _ = self.focus_window_by_id(top);
+            }
+        }
+    }
+
+    fn cascade_position(&self) -> Point<i32, Logical> {
+        let n = self.windows.len() as i32;
+        (24 + 32 * (n % 16), 24 + 32 * (n % 16)).into()
     }
 
     /// Map any committed surface (toplevel, subsurface or popup) to the id of
@@ -390,17 +437,31 @@ impl DesktopState {
             Action::FocusWindow { id } => self.focus_window_by_id(id)?,
             Action::CloseWindow { id } => {
                 let window = self.window_by_id(id)?;
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_close();
+                match window.underlying_surface() {
+                    WindowSurface::Wayland(toplevel) => toplevel.send_close(),
+                    WindowSurface::X11(x11) => {
+                        if let Err(e) = x11.close() {
+                            return Err(format!("failed to close X11 window {id}: {e}"));
+                        }
+                    }
                 }
             }
             Action::ResizeWindow { id, width, height } => {
                 let window = self.window_by_id(id)?;
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some((width.max(1), height.max(1)).into());
-                    });
-                    toplevel.send_configure();
+                match window.underlying_surface() {
+                    WindowSurface::Wayland(toplevel) => {
+                        toplevel.with_pending_state(|state| {
+                            state.size = Some((width.max(1), height.max(1)).into());
+                        });
+                        toplevel.send_configure();
+                    }
+                    WindowSurface::X11(x11) => {
+                        let mut geo = x11.geometry();
+                        geo.size = (width.max(1), height.max(1)).into();
+                        if let Err(e) = x11.configure(Some(geo)) {
+                            return Err(format!("failed to resize X11 window {id}: {e}"));
+                        }
+                    }
                 }
             }
         }
@@ -582,26 +643,38 @@ impl DesktopState {
     }
 
     pub fn focus_window_by_id(&mut self, id: u64) -> Result<(), String> {
+        use smithay::wayland::seat::WaylandFocus;
         let window = self.window_by_id(id)?;
         self.space.raise_element(&window, true);
         let all: Vec<Window> = self.space.elements().cloned().collect();
         for w in all {
             let active = Self::window_id(&w) == Some(id);
-            if let Some(toplevel) = w.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    if active {
-                        state.states.set(xdg_toplevel::State::Activated);
-                    } else {
-                        state.states.unset(xdg_toplevel::State::Activated);
-                    }
-                });
-                toplevel.send_pending_configure();
+            match w.underlying_surface() {
+                WindowSurface::Wayland(toplevel) => {
+                    toplevel.with_pending_state(|state| {
+                        if active {
+                            state.states.set(xdg_toplevel::State::Activated);
+                        } else {
+                            state.states.unset(xdg_toplevel::State::Activated);
+                        }
+                    });
+                    toplevel.send_pending_configure();
+                }
+                WindowSurface::X11(x11) => {
+                    let _ = x11.set_activated(active);
+                }
+            }
+        }
+        if let WindowSurface::X11(x11) = window.underlying_surface() {
+            let x11 = x11.clone();
+            if let Some(xwm) = self.xwm.as_mut() {
+                let _ = xwm.raise_window(&x11);
             }
         }
         let surface = window
-            .toplevel()
-            .map(|t| t.wl_surface().clone())
-            .ok_or_else(|| format!("window {id} has no toplevel surface"))?;
+            .wl_surface()
+            .map(|s| s.into_owned())
+            .ok_or_else(|| format!("window {id} has no surface to focus yet"))?;
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().unwrap();
         keyboard.set_focus(self, Some(surface), serial);
@@ -630,36 +703,45 @@ impl DesktopState {
             let Some(id) = Self::window_id(&window) else {
                 continue;
             };
-            let Some(toplevel) = window.toplevel().cloned() else {
-                continue;
-            };
             let geo = self
                 .space
                 .element_geometry(&window)
                 .unwrap_or_else(|| Rectangle::from_size((0, 0).into()));
-            let (title, app_id) = with_states(toplevel.wl_surface(), |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .map(|d| {
-                        let d = d.lock().unwrap();
-                        (
-                            d.title.clone().unwrap_or_default(),
-                            d.app_id.clone().unwrap_or_default(),
-                        )
-                    })
-                    .unwrap_or_default()
-            });
-            let pid = toplevel
-                .wl_surface()
-                .client()
-                .and_then(|c| c.get_credentials(&self.display_handle).ok())
-                .map(|c| c.pid);
-            let frozen = toplevel
-                .client()
-                .pipe(|sc| shell_client_key(&sc))
-                .map(|key| self.client_frozen(key))
-                .unwrap_or(false);
+            let (title, app_id, pid, frozen, x11) = match window.underlying_surface() {
+                WindowSurface::Wayland(toplevel) => {
+                    let (title, app_id) = with_states(toplevel.wl_surface(), |states| {
+                        states
+                            .data_map
+                            .get::<XdgToplevelSurfaceData>()
+                            .map(|d| {
+                                let d = d.lock().unwrap();
+                                (
+                                    d.title.clone().unwrap_or_default(),
+                                    d.app_id.clone().unwrap_or_default(),
+                                )
+                            })
+                            .unwrap_or_default()
+                    });
+                    let pid = toplevel
+                        .wl_surface()
+                        .client()
+                        .and_then(|c| c.get_credentials(&self.display_handle).ok())
+                        .map(|c| c.pid);
+                    let frozen = shell_client_key(&toplevel.client())
+                        .map(|key| self.client_frozen(key))
+                        .unwrap_or(false);
+                    (title, app_id, pid, frozen, false)
+                }
+                // X11 clients don't participate in xdg ping, so no freeze
+                // detection for them. The pid comes from _NET_WM_PID.
+                WindowSurface::X11(x) => (
+                    x.title(),
+                    x.class(),
+                    x.pid().map(|p| p as i32),
+                    false,
+                    true,
+                ),
+            };
             let is_new = known_at_start
                 .map(|known| !known.contains(&id))
                 .unwrap_or(false);
@@ -686,6 +768,7 @@ impl DesktopState {
                 changed: changed.contains(&id) || is_new,
                 new: is_new,
                 pid,
+                x11,
                 screenshot_png,
             });
         }
@@ -703,14 +786,6 @@ impl DesktopState {
     }
 }
 
-/// Tiny helper: method-chaining for plain values.
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-impl<T: Sized> Pipe for T {}
-
 // ----------------------------------------------------------------------
 // smithay protocol handlers
 // ----------------------------------------------------------------------
@@ -721,6 +796,10 @@ impl CompositorHandler for DesktopState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // The XWayland connection is inserted by smithay with its own data.
+        if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
@@ -789,18 +868,9 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let id = self.next_window_id;
-        self.next_window_id += 1;
-
-        let window = Window::new_wayland_window(surface);
-        window.user_data().insert_if_missing(|| WindowIdTag(id));
-
         // Cascade new windows so they don't fully overlap.
-        let n = self.windows.len() as i32;
-        let pos = (24 + 32 * (n % 16), 24 + 32 * (n % 16));
-        self.space.map_element(window.clone(), pos, true);
-        self.windows.insert(id, window);
-        self.note_window_activity(id);
+        let pos = self.cascade_position();
+        let id = self.register_window(Window::new_wayland_window(surface), pos, true);
         let _ = self.focus_window_by_id(id);
         tracing::info!(window = id, "new toplevel");
     }
@@ -809,16 +879,7 @@ impl XdgShellHandler for DesktopState {
         let window = self.window_for_surface(surface.wl_surface());
         if let Some(window) = window {
             if let Some(id) = Self::window_id(&window) {
-                self.space.unmap_elem(&window);
-                self.windows.remove(&id);
-                self.note_window_closed(id);
-                if self.focused_window == Some(id) {
-                    self.focused_window = None;
-                    let top = self.space.elements().last().and_then(Self::window_id);
-                    if let Some(top) = top {
-                        let _ = self.focus_window_by_id(top);
-                    }
-                }
+                self.unregister_window(id);
                 tracing::info!(window = id, "toplevel destroyed");
             }
         }
@@ -902,6 +963,171 @@ impl ClientDndGrabHandler for DesktopState {}
 impl ServerDndGrabHandler for DesktopState {}
 
 impl OutputHandler for DesktopState {}
+
+// ----------------------------------------------------------------------
+// XWayland: X11 windows are integrated as regular space windows
+// ----------------------------------------------------------------------
+
+impl XWaylandShellHandler for DesktopState {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+
+    fn surface_associated(&mut self, _xwm: XwmId, _surface: WlSurface, window: X11Surface) {
+        // The window becomes renderable now; report it as activity so pending
+        // waits pick it up, and (re)apply focus — at map time the wl_surface
+        // did not exist yet, so the initial focus attempt was a no-op.
+        if let Some(w) = self.window_for_x11(&window) {
+            if let Some(id) = Self::window_id(&w) {
+                self.note_window_activity(id);
+                let is_top = self.space.elements().last().and_then(Self::window_id) == Some(id);
+                if is_top && !window.is_override_redirect() {
+                    let _ = self.focus_window_by_id(id);
+                }
+            }
+        }
+    }
+}
+
+impl XwmHandler for DesktopState {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm.as_mut().expect("XWM events without an XWM")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Err(e) = window.set_mapped(true) {
+            tracing::warn!("failed to map X11 window: {e}");
+            return;
+        }
+        // Honor the requested size (clamped to the screen), place at the
+        // cascade position. The X11 root coordinates always mirror the
+        // compositor space so that menus position themselves correctly.
+        let mut geo = window.geometry();
+        if geo.size.w < 10 || geo.size.h < 10 {
+            geo.size = (800, 600).into();
+        }
+        geo.size.w = geo.size.w.min(self.screen_size.w);
+        geo.size.h = geo.size.h.min(self.screen_size.h);
+        geo.loc = self.cascade_position();
+        let _ = window.configure(Some(geo));
+        let id = self.register_window(Window::new_x11_window(window), geo.loc, true);
+        // Focus may fail until the wl_surface is associated; that's fine.
+        let _ = self.focus_window_by_id(id);
+        tracing::info!(window = id, "new X11 window");
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Menus/tooltips: keep them exactly where the client put them.
+        let loc = window.geometry().loc;
+        self.register_window(Window::new_x11_window(window), loc, false);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(w) = self.window_for_x11(&window) {
+            if let Some(id) = Self::window_id(&w) {
+                self.unregister_window(id);
+                tracing::info!(window = id, "X11 window unmapped");
+            }
+        }
+        if !window.is_override_redirect() {
+            let _ = window.set_mapped(false);
+        }
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(w) = self.window_for_x11(&window) {
+            if let Some(id) = Self::window_id(&w) {
+                self.unregister_window(id);
+            }
+        }
+    }
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geo = window.geometry();
+        if let Some(x) = x {
+            geo.loc.x = x;
+        }
+        if let Some(y) = y {
+            geo.loc.y = y;
+        }
+        if let Some(w) = w {
+            geo.size.w = (w as i32).min(self.screen_size.w).max(1);
+        }
+        if let Some(h) = h {
+            geo.size.h = (h as i32).min(self.screen_size.h).max(1);
+        }
+        let _ = window.configure(Some(geo));
+        if let Some(win) = self.window_for_x11(&window) {
+            self.space.map_element(win, geo.loc, false);
+        }
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<smithay::xwayland::xwm::X11Window>,
+    ) {
+        if let Some(win) = self.window_for_x11(&window) {
+            if self.space.element_location(&win) != Some(geometry.loc) {
+                self.space.map_element(win.clone(), geometry.loc, false);
+            }
+            if let Some(id) = Self::window_id(&win) {
+                self.note_window_activity(id);
+            }
+        }
+    }
+
+    fn property_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        // Title or state changes count as UI activity.
+        if let Some(win) = self.window_for_x11(&window) {
+            if let Some(id) = Self::window_id(&win) {
+                self.note_window_activity(id);
+            }
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _button: u32,
+        _resize_edge: X11ResizeEdge,
+    ) {
+        // Interactive resize by injected input is not supported.
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        _selection: smithay::wayland::selection::SelectionTarget,
+        _mime_type: String,
+        _fd: std::os::unix::io::OwnedFd,
+    ) {
+    }
+}
+
+delegate_xwayland_shell!(DesktopState);
 
 delegate_compositor!(DesktopState);
 delegate_shm!(DesktopState);

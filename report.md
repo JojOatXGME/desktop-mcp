@@ -94,10 +94,36 @@ Caveats: GTK3 apps additionally need the `libatk-adaptor` package; apps
 without AT-SPI support simply yield no `accessibility` field (best-effort by
 design).
 
-### 9. No XWayland support
-Only Wayland-native clients are supported. XWayland would pull in an X11
-stack and rootful/rootless window integration; out of scope for v1. Modern
-GTK/Qt/SDL/winit apps all speak Wayland natively.
+### 9. XWayland support
+X11 applications are supported through XWayland (smithay's `xwayland`
+feature). On startup the compositor spawns an XWayland server, attaches
+smithay's `X11Wm`, and exports `DISPLAY` alongside the other environment
+variables. X11 windows are wrapped in the same `desktop::Window` type as
+Wayland toplevels, so they share the window registry, cascade placement,
+rendering, screenshots, pointer/keyboard input injection and focus handling.
+Window metadata for X11 comes from X11 properties (title = `WM_NAME`,
+app_id = `WM_CLASS`, pid = `_NET_WM_PID`); each window carries an `x11: true`
+flag in its state.
+
+Two X11-specific behaviours differ from the Wayland path:
+- **No ping/freeze detection.** X11 clients don't participate in xdg ping, so
+  they are never marked `frozen`. To keep transition detection reliable, any
+  wait involving an X11 window uses a 400 ms settle grace (a quiet period
+  after the last commit) instead of relying on the two-quiet-ping-rounds rule,
+  which would otherwise complete before the app finishes redrawing.
+- **PID for accessibility** is taken from `_NET_WM_PID` (the Wayland client
+  credentials would report XWayland itself), so a11y correlation still works.
+
+Environment requirements (documented in the README): the `Xwayland` binary
+and Mesa GL libraries (`libegl1`/`libgl1` — Xwayland aborts at startup without
+`libEGL.so.1`, then falls back to software rendering). Interactive
+X11 move/resize *requests* (client-initiated drags) are accepted but ignored,
+since all input is injected; `resize_window` drives X11 windows via
+`ConfigureRequest`.
+
+The Wayland-native accessibility protocols (Newton/AccessKit, "Method 2" in
+`llm-pointing-support.md`) remain unimplemented; the AT-SPI D-Bus path already
+covers XWayland'd apps, including Java Swing (see divergence 8).
 
 ### 10. Popup grabs are not implemented
 `xdg_popup.grab` is acknowledged but no grab semantics are enforced. Popups
@@ -134,7 +160,8 @@ without rescaling.
 `apt` failed only because of missing root rights; `sudo apt-get` works in
 this container. Installed for build and testing: `libxkbcommon-dev`,
 `libpixman-1-dev`, `libwayland-dev`, `dbus`, `at-spi2-core`, `wayland-utils`,
-`fonts-dejavu-core`, and the test apps `foot` and `zenity`.
+`fonts-dejavu-core`, the test apps `foot` and `zenity`, and for XWayland
+`xwayland`, `libegl1`, `libgl1`, plus the X11 test apps `xterm`/`xcalc`.
 
 ## Design notes (not divergences)
 

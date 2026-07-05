@@ -136,8 +136,9 @@ fn run_server(
     runtime_dir: PathBuf,
     ready_pipe: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    // Auto-reap applications spawned via the launch_app tool.
-    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    // Note: SIGCHLD must keep its default disposition. SIG_IGN would be
+    // inherited by exec'd children (e.g. Xwayland) and break their own
+    // child-process handling. launch_app children are reaped by tokio.
 
     // Accessibility infrastructure (private session bus + at-spi). Optional.
     let a11y_buses = match a11y::spawn_buses() {
@@ -256,6 +257,67 @@ fn run_server(
         )
         .map_err(|e| anyhow::anyhow!("failed to insert heartbeat timer: {e}"))?;
 
+    // XWayland for X11 applications (best effort). The X11 socket directory
+    // usually exists on real systems but not in minimal containers.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .mode(0o1777)
+            .create("/tmp/.X11-unix");
+    }
+    match smithay::xwayland::XWayland::spawn(
+        &display_handle,
+        None,
+        std::iter::empty::<(String, String)>(),
+        true,
+        std::process::Stdio::null(),
+        // Xwayland's own messages go to our stderr/log.
+        std::process::Stdio::inherit(),
+        |_| (),
+    ) {
+        Ok((xwayland, x_client)) => {
+            let wm_handle = handle.clone();
+            let ret = handle.insert_source(xwayland, move |event, _, state| match event {
+                smithay::xwayland::XWaylandEvent::Ready {
+                    x11_socket,
+                    display_number,
+                } => match smithay::xwayland::X11Wm::start_wm(
+                    wm_handle.clone(),
+                    x11_socket,
+                    x_client.clone(),
+                ) {
+                    Ok(wm) => {
+                        state.xwm = Some(wm);
+                        state.xdisplay = Some(display_number);
+                        tracing::info!("XWayland ready on DISPLAY=:{display_number}");
+                    }
+                    Err(e) => tracing::warn!("failed to attach X11 window manager: {e}"),
+                },
+                smithay::xwayland::XWaylandEvent::Error => {
+                    tracing::warn!("XWayland failed to start; X11 apps unavailable");
+                }
+            });
+            if let Err(e) = ret {
+                tracing::warn!("failed to insert XWayland source: {e}");
+            } else {
+                // Wait for XWayland readiness while still single-threaded so
+                // DISPLAY can be set safely and is part of the env report.
+                let t0 = std::time::Instant::now();
+                while state.xdisplay.is_none() && t0.elapsed() < Duration::from_secs(10) {
+                    event_loop
+                        .dispatch(Some(Duration::from_millis(100)), &mut state)
+                        .context("event loop failed during XWayland startup")?;
+                }
+                match state.xdisplay {
+                    // SAFETY: no other threads are running yet.
+                    Some(n) => unsafe { std::env::set_var("DISPLAY", format!(":{n}")) },
+                    None => tracing::warn!("XWayland did not become ready within 10s"),
+                }
+            }
+        }
+        Err(e) => tracing::warn!("could not spawn XWayland (X11 apps unavailable): {e}"),
+    }
+
     // HTTP layer (MCP + monitor) on its own tokio thread.
     let mcp_url = format!("http://127.0.0.1:{}/mcp", opts.port);
     let monitor_url = format!("http://127.0.0.1:{}/", opts.port);
@@ -337,6 +399,9 @@ fn run_server(
     add("SDL_VIDEODRIVER", "wayland");
     add("GTK_CSD", "1");
     add("XKB_DEFAULT_LAYOUT", "us");
+    if let Some(n) = state.xdisplay {
+        add("DISPLAY", &format!(":{n}"));
+    }
     if let Some(buses) = &a11y_buses {
         add("DBUS_SESSION_BUS_ADDRESS", &buses.session_bus_address);
         add("GTK_A11Y", "atspi");

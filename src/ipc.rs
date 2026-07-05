@@ -178,6 +178,9 @@ pub struct WindowInfo {
     pub new: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
+    /// Window belongs to an X11 application running through XWayland.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub x11: bool,
     /// PNG-encoded screenshot; emitted separately as MCP image content.
     #[serde(skip)]
     pub screenshot_png: Option<Vec<u8>>,
