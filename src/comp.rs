@@ -138,8 +138,18 @@ impl DesktopState {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
 
         let mut seat: Seat<Self> = seat_state.new_wl_seat(dh, "desktop-mcp");
-        seat.add_keyboard(XkbConfig::default(), 400, 40)
-            .map_err(|e| anyhow::anyhow!("failed to add keyboard: {e:?}"))?;
+        // Pin the layout explicitly: XkbConfig::default() would fall back to
+        // the host's XKB_DEFAULT_* environment, but input injection (KeyMapper)
+        // resolves characters against the us layout.
+        seat.add_keyboard(
+            XkbConfig {
+                layout: "us",
+                ..XkbConfig::default()
+            },
+            400,
+            40,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to add keyboard: {e:?}"))?;
         seat.add_pointer();
 
         let output = Output::new(

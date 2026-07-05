@@ -155,6 +155,15 @@ this container. Installed for build and testing: `libxkbcommon-dev`,
   timeout — that is the prompt's intended step-4 behaviour.
 - **launch_app** waits for the first *new window* before the quiet-round rule
   may finish the wait, so slow app startups don't return an empty desktop.
+- **Client environment:** the daemon exports (and sets for `launch_app`
+  children) `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `GDK_BACKEND=wayland`,
+  `QT_QPA_PLATFORM=wayland`, `SDL_VIDEODRIVER=wayland`, `GTK_CSD=1`,
+  `XKB_DEFAULT_LAYOUT=us`, the D-Bus/accessibility variables, and unsets
+  `DISPLAY` inside the daemon so no client accidentally attaches to a foreign
+  X server (e.g. WSLg). The compositor keymap layout is additionally pinned
+  to "us" in code (not via environment), because input injection resolves
+  characters against the us layout and the keyboard is created before the
+  environment is finalized.
 - **wait** (the "wait for the next screen" tool from the prompt) first waits
   for at least one UI update and then uses time-based settling instead of the
   two-round rule: the screen counts as settled once no update arrived for

@@ -168,8 +168,23 @@ fn run_server(
     }
     .context("failed to bind Wayland socket")?;
     let socket_name = socket.socket_name().to_string_lossy().to_string();
+    // Point every toolkit at this compositor. Without the explicit backend
+    // overrides, Qt defaults to X11 (xcb), SDL2 prefers X11, and GTK could
+    // pick a foreign X server if DISPLAY is set (e.g. WSLg).
     // SAFETY: no other threads are running yet.
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+        std::env::set_var("GDK_BACKEND", "wayland");
+        std::env::set_var("QT_QPA_PLATFORM", "wayland");
+        std::env::set_var("SDL_VIDEODRIVER", "wayland");
+        // We don't implement xdg-decoration, so clients must draw their own
+        // decorations.
+        std::env::set_var("GTK_CSD", "1");
+        // Keep clients' own keymap fallbacks in sync with the compositor
+        // keymap (input injection assumes the us layout).
+        std::env::set_var("XKB_DEFAULT_LAYOUT", "us");
+        std::env::remove_var("DISPLAY");
+    }
 
     let handle = event_loop.handle();
     handle
@@ -317,6 +332,11 @@ fn run_server(
     };
     add("WAYLAND_DISPLAY", &socket_name);
     add("XDG_RUNTIME_DIR", &runtime_dir.to_string_lossy());
+    add("GDK_BACKEND", "wayland");
+    add("QT_QPA_PLATFORM", "wayland");
+    add("SDL_VIDEODRIVER", "wayland");
+    add("GTK_CSD", "1");
+    add("XKB_DEFAULT_LAYOUT", "us");
     if let Some(buses) = &a11y_buses {
         add("DBUS_SESSION_BUS_ADDRESS", &buses.session_bus_address);
         add("GTK_A11Y", "atspi");
