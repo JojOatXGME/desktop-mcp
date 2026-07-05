@@ -40,6 +40,13 @@ pub struct Wait {
     /// round in flight.
     pub round: Option<Vec<u64>>,
     pub round_dirty: bool,
+    /// Time-based settling (the `wait` tool): settled once this much time
+    /// passed without updates. None = two-quiet-rounds rule.
+    pub quiet_time: Option<Duration>,
+    /// Don't finish before at least one update was observed.
+    pub require_activity: bool,
+    pub has_activity: bool,
+    pub last_activity: Instant,
     pub snapshot: SnapshotRequest,
     pub reply: Option<oneshot::Sender<Result<DesktopSnapshot, String>>>,
     pub warnings: Vec<String>,
@@ -63,6 +70,10 @@ impl DesktopState {
             quiet_rounds: 0,
             round: None,
             round_dirty: false,
+            quiet_time: params.quiet_time_ms.map(Duration::from_millis),
+            require_activity: params.require_activity,
+            has_activity: false,
+            last_activity: Instant::now(),
             snapshot,
             reply: Some(reply),
             warnings,
@@ -81,6 +92,8 @@ impl DesktopState {
             if relevant {
                 wait.changed.insert(id);
                 wait.round_dirty = true;
+                wait.has_activity = true;
+                wait.last_activity = Instant::now();
             }
         }
     }
@@ -94,6 +107,8 @@ impl DesktopState {
             if relevant {
                 wait.closed.push(id);
                 wait.round_dirty = true;
+                wait.has_activity = true;
+                wait.last_activity = Instant::now();
             }
         }
     }
@@ -220,7 +235,17 @@ impl DesktopState {
                     }
                     wait.round = None;
                     wait.round_dirty = false;
-                    if wait.quiet_rounds >= QUIET_ROUNDS {
+                    let settled = match wait.quiet_time {
+                        // Interaction tools: two quiet ping-pong rounds.
+                        None => wait.quiet_rounds >= QUIET_ROUNDS,
+                        // The `wait` tool: a quiet *period* (with working
+                        // ping-pongs), after at least one observed update.
+                        Some(quiet_time) => {
+                            (!wait.require_activity || wait.has_activity)
+                                && wait.last_activity.elapsed() >= quiet_time
+                        }
+                    };
+                    if settled {
                         finished.push((i, false));
                     }
                 }

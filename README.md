@@ -53,6 +53,7 @@ Options (both modes): `--port <p>` (default 8080), `--width/--height`
 | Tool | Purpose |
 | --- | --- |
 | `get_state` | Observe: window list + screenshots + accessibility |
+| `wait` | Wait for the next screen (after loading indicators); settles once no update arrived for `settle_ms` (default 1.5 s), timeout `wait_ms` (default 60 s) |
 | `click` / `mouse_down` / `mouse_up` / `mouse_move` | Pointer input |
 | `scroll` | Wheel scrolling |
 | `type_text` | Type text (`\n` = Return, `\t` = Tab) |

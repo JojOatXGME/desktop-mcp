@@ -59,6 +59,9 @@ pub fn spawn_buses() -> anyhow::Result<A11yBuses> {
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &address);
         std::env::set_var("GTK_A11Y", "atspi");
         std::env::set_var("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1");
+        // Java Swing publishes its accessible tree only with the ATK wrapper
+        // enabled.
+        std::env::set_var("ASSISTIVE_TECHNOLOGIES", "org.GNOME.Accessibility.AtkWrapper");
         std::env::remove_var("NO_AT_BRIDGE");
     }
 

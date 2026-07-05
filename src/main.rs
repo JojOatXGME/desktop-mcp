@@ -321,6 +321,7 @@ fn run_server(
         add("DBUS_SESSION_BUS_ADDRESS", &buses.session_bus_address);
         add("GTK_A11Y", "atspi");
         add("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1");
+        add("ASSISTIVE_TECHNOLOGIES", "org.GNOME.Accessibility.AtkWrapper");
     }
     add("DESKTOP_MCP_URL", &mcp_url);
     add("DESKTOP_MCP_MONITOR_URL", &monitor_url);

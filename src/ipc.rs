@@ -93,6 +93,13 @@ pub struct WaitParams {
     /// appeared (used by launch_app so it doesn't return before the app maps
     /// its first window).
     pub expect_new_window: bool,
+    /// Time-based settling instead of the two-quiet-rounds rule: the UI
+    /// counts as settled once no update arrived for this long (used by the
+    /// `wait` tool to ride out slow loading indicators).
+    pub quiet_time_ms: Option<u64>,
+    /// Don't finish (except on timeout) before at least one UI update was
+    /// observed ("wait for the window taking any action").
+    pub require_activity: bool,
 }
 
 impl Default for WaitParams {
@@ -101,6 +108,8 @@ impl Default for WaitParams {
             timeout_ms: 3000,
             watch_window: None,
             expect_new_window: false,
+            quiet_time_ms: None,
+            require_activity: false,
         }
     }
 }

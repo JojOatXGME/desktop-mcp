@@ -71,8 +71,7 @@ async fn state_json(State(state): State<AppState>) -> impl IntoResponse {
         action: Action::None,
         wait: WaitParams {
             timeout_ms: 0,
-            watch_window: None,
-            expect_new_window: false,
+            ..Default::default()
         },
         snapshot: SnapshotRequest {
             include: Include::All,

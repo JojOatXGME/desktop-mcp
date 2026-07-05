@@ -36,9 +36,9 @@ ping-pong rounds without any surface commit** (rounds evaluated every 50 ms).
 likewise a per-client property reported on each of the client's windows.
 
 ### 3. Additional MCP tools beyond the prompt's list
-Implemented: `get_state`, `click`, `mouse_down`, `mouse_up`, `mouse_move`,
-`scroll`, `type_text`, `press_key` — plus `launch_app`, `focus_window`,
-`close_window`, `resize_window`.
+Implemented: `get_state`, `wait`, `click`, `mouse_down`, `mouse_up`,
+`mouse_move`, `scroll`, `type_text`, `press_key` — plus `launch_app`,
+`focus_window`, `close_window`, `resize_window`.
 **Reason:** without `launch_app` the model has no way to start applications
 with the right environment (`WAYLAND_DISPLAY`, D-Bus, accessibility vars).
 The window-management tools map to xdg-shell requests the compositor must
@@ -105,11 +105,30 @@ GTK/Qt/SDL/winit apps all speak Wayland natively.
 resolution, and report as changes on their parent window. Grab semantics
 matter for real users with real seats; for injected input they add nothing.
 
-### 11. The three share.google links could not be read
-The `share.google/aimode/…` links in `promt.md` are JavaScript-gated Google
-"AI mode" shares that cannot be fetched from this environment. The design was
-implemented from the smithay 0.7 / rmcp 2.1 / atspi 0.30 sources and docs
-instead.
+### 11. Reference links
+The `share.google/aimode/…` links were initially unreadable (JavaScript-gated)
+and the design was implemented from the smithay 0.7 / rmcp 2.1 / atspi 0.30
+sources instead. The markdown exports added later
+(`wayland-compositor-library.md`, `rust-mcp-framework.md`,
+`llm-pointing-support.md`) were reviewed afterwards; the implementation
+already matches their recommendations:
+- smithay with a headless backend, damage tracking and seat-based input
+  injection;
+- rmcp with `#[tool]` macros, schemars-derived parameter schemas and
+  base64/PNG image content;
+- "Strategy 2" for pointing support: clean, unobstructed screenshots plus the
+  element bounding boxes as structured JSON (`accessibility` → `bounds`,
+  `[x, y, width, height]`, origin top-left) instead of drawing overlays;
+- AT-SPI fallback correlated by PID, extents via `CoordType::Window`
+  (Wayland-native accessibility protocols like Newton/AccessKit are not yet
+  standardized, so only the D-Bus path is implemented);
+- `ASSISTIVE_TECHNOLOGIES=org.GNOME.Accessibility.AtkWrapper` is exported so
+  Java Swing apps publish their accessible tree too (untested — no JRE in the
+  container).
+Regarding the Claude vision-coordinates guidance: the default 1280×800 output
+(≈1.02 MP) stays below the ~1.15 MP threshold above which Claude downsizes
+images, so model-returned pixel coordinates map 1:1 onto the screenshots
+without rescaling.
 
 ### 12. `apt` works with sudo
 `apt` failed only because of missing root rights; `sudo apt-get` works in
@@ -136,6 +155,12 @@ this container. Installed for build and testing: `libxkbcommon-dev`,
   timeout — that is the prompt's intended step-4 behaviour.
 - **launch_app** waits for the first *new window* before the quiet-round rule
   may finish the wait, so slow app startups don't return an empty desktop.
+- **wait** (the "wait for the next screen" tool from the prompt) first waits
+  for at least one UI update and then uses time-based settling instead of the
+  two-round rule: the screen counts as settled once no update arrived for
+  `settle_ms` (default 1500 ms) while ping-pongs keep working. Its overall
+  timeout defaults to 60 s (`wait_ms`) since loading may take long; on expiry
+  the current state is returned with `timed_out: true`.
 - `default_wait` for `get_state` is 1500 ms since it usually observes an idle
   desktop; interaction tools default to 3000 ms as specified; every tool
   accepts `wait_ms` (0 = immediate snapshot).

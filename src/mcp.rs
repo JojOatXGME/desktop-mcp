@@ -190,6 +190,28 @@ pub struct ResizeParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct WaitToolParams {
+    /// The screen counts as settled once no UI update arrived for this many
+    /// milliseconds (default 1500). Increase for loading indicators that
+    /// update infrequently.
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    /// Overall timeout in milliseconds (default 60000). On expiry the
+    /// current state is returned with timed_out=true.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    /// Only track changes of this window id (and of newly created windows).
+    #[serde(default)]
+    pub watch_window: Option<u64>,
+    /// Attach screenshots of the reported windows (default true).
+    #[serde(default)]
+    pub screenshots: Option<bool>,
+    /// Attach accessibility (AT-SPI) metadata (default true).
+    #[serde(default)]
+    pub accessibility: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct LaunchParams {
     /// Program to launch. Run with `sh -c` when `args` is omitted, so shell
     /// syntax is allowed.
@@ -205,6 +227,24 @@ pub struct LaunchParams {
 // Implementation
 // ---------------------------------------------------------------------
 
+/// Per-tool defaults for the transition wait.
+#[derive(Default)]
+struct Tuning {
+    default_wait_ms: u64,
+    expect_new_window: bool,
+    quiet_time_ms: Option<u64>,
+    require_activity: bool,
+}
+
+impl Tuning {
+    fn interaction(default_wait_ms: u64) -> Self {
+        Tuning {
+            default_wait_ms,
+            ..Default::default()
+        }
+    }
+}
+
 impl DesktopMcp {
     pub fn new(tx: Sender<Request>, a11y: Arc<Option<A11y>>, env: EnvInfo) -> Self {
         DesktopMcp {
@@ -219,7 +259,12 @@ impl DesktopMcp {
         &self,
         observe: &ObserveParams,
     ) -> Result<CallToolResult, ErrorData> {
-        self.perform(Action::None, observe, Include::Changed, 8000, true)
+        let tuning = Tuning {
+            default_wait_ms: 8000,
+            expect_new_window: true,
+            ..Default::default()
+        };
+        self.perform(Action::None, observe, Include::Changed, tuning)
             .await
     }
 
@@ -228,10 +273,9 @@ impl DesktopMcp {
         action: Action,
         observe: &ObserveParams,
         include: Include,
-        default_wait_ms: u64,
-        expect_new_window: bool,
+        tuning: Tuning,
     ) -> Result<CallToolResult, ErrorData> {
-        let wait_ms = observe.wait_ms.unwrap_or(default_wait_ms);
+        let wait_ms = observe.wait_ms.unwrap_or(tuning.default_wait_ms);
         let screenshots = observe.screenshots.unwrap_or(true);
         let accessibility = observe.accessibility.unwrap_or(true);
 
@@ -241,7 +285,9 @@ impl DesktopMcp {
             wait: WaitParams {
                 timeout_ms: wait_ms,
                 watch_window: observe.watch_window,
-                expect_new_window,
+                expect_new_window: tuning.expect_new_window,
+                quiet_time_ms: tuning.quiet_time_ms,
+                require_activity: tuning.require_activity,
             },
             snapshot: SnapshotRequest {
                 include,
@@ -359,7 +405,7 @@ impl DesktopMcp {
             Some(ids) => Include::Windows(ids),
             None => Include::All,
         };
-        self.perform(Action::None, &p.observe, include, 1500, false).await
+        self.perform(Action::None, &p.observe, include, Tuning::interaction(1500)).await
     }
 
     #[tool(
@@ -378,7 +424,7 @@ impl DesktopMcp {
             window: p.window,
             double: p.double.unwrap_or(false),
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -397,7 +443,7 @@ impl DesktopMcp {
             y: p.y,
             window: p.window,
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -415,7 +461,7 @@ impl DesktopMcp {
             y: p.y,
             window: p.window,
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -433,7 +479,7 @@ impl DesktopMcp {
             y: p.y,
             window: p.window,
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -451,7 +497,7 @@ impl DesktopMcp {
             y: p.y,
             window: p.window,
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -468,8 +514,7 @@ impl DesktopMcp {
             Action::TypeText { text: p.text },
             &p.observe,
             Include::Changed,
-            3000,
-            false,
+            Tuning::interaction(3000),
         )
         .await
     }
@@ -488,7 +533,7 @@ impl DesktopMcp {
             combo: p.key,
             repeat: p.repeat.unwrap_or(1),
         };
-        self.perform(action, &p.observe, Include::Changed, 3000, false).await
+        self.perform(action, &p.observe, Include::Changed, Tuning::interaction(3000)).await
     }
 
     #[tool(
@@ -504,8 +549,7 @@ impl DesktopMcp {
             Action::FocusWindow { id: p.window },
             &p.observe,
             Include::Changed,
-            3000,
-            false,
+            Tuning::interaction(3000),
         )
         .await
     }
@@ -524,8 +568,7 @@ impl DesktopMcp {
             Action::CloseWindow { id: p.window },
             &p.observe,
             Include::Changed,
-            3000,
-            false,
+            Tuning::interaction(3000),
         )
         .await
     }
@@ -548,10 +591,35 @@ impl DesktopMcp {
             },
             &p.observe,
             Include::Changed,
-            3000,
-            false,
+            Tuning::interaction(3000),
         )
         .await
+    }
+
+    #[tool(
+        name = "wait",
+        description = "Wait for the next screen: use this after a tool returned a loading \
+                       indicator or an in-progress UI. Waits until at least one UI update \
+                       happened and then no further update arrived for settle_ms (default \
+                       1500 ms), or until wait_ms (default 60000 ms — loading may take long) \
+                       expires. Returns the settled UI state of the changed windows."
+    )]
+    async fn wait(&self, params: Parameters<WaitToolParams>) -> Result<CallToolResult, ErrorData> {
+        let p = params.0;
+        let observe = ObserveParams {
+            wait_ms: Some(p.wait_ms.unwrap_or(60_000)),
+            watch_window: p.watch_window,
+            screenshots: p.screenshots,
+            accessibility: p.accessibility,
+        };
+        let tuning = Tuning {
+            default_wait_ms: 60_000,
+            quiet_time_ms: Some(p.settle_ms.unwrap_or(1500).max(1)),
+            require_activity: true,
+            ..Default::default()
+        };
+        self.perform(Action::None, &observe, Include::Changed, tuning)
+            .await
     }
 
     #[tool(
@@ -604,7 +672,8 @@ impl ServerHandler for DesktopMcp {
                  window list plus screenshots and accessibility metadata of changed windows — \
                  no separate screenshot polling is needed. Coordinates: pass `window` to use \
                  window-relative coordinates matching that window's screenshot; without it, \
-                 coordinates are global desktop pixels. Start apps with launch_app. A human can \
+                 coordinates are global desktop pixels. Start apps with launch_app. If a result \
+                 shows a loading indicator or in-progress UI, call the wait tool. A human can \
                  watch the desktop read-only at {monitor}.",
                 display = self.env.wayland_display,
                 monitor = self.env.monitor_url,
