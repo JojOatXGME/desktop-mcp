@@ -48,6 +48,31 @@ Options (both modes): `--port <p>` (default 8080), `--width/--height`
 - Human monitor: `http://127.0.0.1:8080/` (read-only live view)
 - Daemon log: `$XDG_RUNTIME_DIR/desktop-mcp.log`
 
+### Reaching the web UI from outside the container / WSL
+
+The server binds to `127.0.0.1` inside the dev container. When the container
+runs in WSL and VS Code's automatic port forwarding is not available, two
+`socat` relays (run from Windows) bridge the gap:
+
+```sh
+# 1. Inside the container: expose 127.0.0.1:8080 on all container interfaces
+wsl npx @devcontainers/cli exec socat TCP-LISTEN:9090,fork,bind=0.0.0.0 TCP:127.0.0.1:8080
+
+# 2. Inside WSL: forward localhost:8080 to the container's IP
+wsl socat TCP-LISTEN:8080,fork,bind=127.0.0.1 TCP:172.17.0.2:9090
+```
+
+The container IP (`172.17.0.2` above) can be looked up with:
+
+```sh
+wsl npx @devcontainers/cli exec ip addr
+```
+
+Windows forwards localhost requests into WSL automatically, so the monitor is
+then reachable at `http://127.0.0.1:8080/` from the Windows browser.
+(A more robust forwarding mechanism for running this setup outside VS Code is
+an open follow-up.)
+
 ## MCP tools
 
 | Tool | Purpose |
