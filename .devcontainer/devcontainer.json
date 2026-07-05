@@ -19,11 +19,11 @@
       "type": "volume"
     }
     // Persist Claude Code authentication and settings
-    {
-      "source": "devcontainer-claude-code-config-${devcontainerId}",
-      "target": "/home/vscode/.claude",
-      "type": "volume"
-    }
+    //{
+    //  "source": "devcontainer-claude-code-config-${devcontainerId}",
+    //  "target": "/home/vscode/.claude",
+    //  "type": "volume"
+    //}
   ]
 
   // Use 'forwardPorts' to make a list of ports inside the container available locally.
