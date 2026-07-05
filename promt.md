@@ -37,7 +37,11 @@ To simplify design, the Compositor sets the display resolution to a reslution ma
 ## MCP Tools
 
 - A tool to see the current state of any window, a list of windows, or all windows at once.
-  This tool effectivly starts at step 3 of the previously described process, except that we return the window states even if nothing changes.
+  This tool effectivly starts at step 3 of the previously described process, except that we don't wait for an action, and we return the window states even if nothing changes.
+- Wait for the next screen. This tool can be used when the LLM receives a loading indicator.
+  This tool is very similar to the show status tool. We start at step 3, but this time include the initial step to wait for an action.
+  This tool also requires more then two ping-pong-cycle to handle loading indicators with less frequent updates. About 1.5 seconds without updates (but working ping-pong-cycles) should be the default and enough for most UIs, but the value should be configurable.
+  This tool also requires the timeout-input which is optional for all the other tools. The default of 3 seconds is probably not appropriate for this call, as we might expect timeouts mesured in minutes.
 - Click, hold, release mouse button.
 - Type a text
 - Type a specific keyboard button
@@ -61,10 +65,10 @@ You may also add other commonly used libraries.
 
 Read through the following links to get a more detailed perspective.
 
-- https://share.google/aimode/cPwfjsFdXB3V09fdg
-- https://share.google/aimode/ChCB7x1SI6cv2KrJR
-- https://share.google/aimode/m1mCIug0USzADHcpZ
-- 
+- https://share.google/aimode/cPwfjsFdXB3V09fdg (also available as wayland-compositor-library.md)
+- https://share.google/aimode/ChCB7x1SI6cv2KrJR (also available as rust-mcp-framework.md)
+- https://share.google/aimode/m1mCIug0USzADHcpZ (also available as llm-pointing-support.md)
+- https://platform.claude.com/docs/en/build-with-claude/vision-coordinates
 
 ## Validation
 
