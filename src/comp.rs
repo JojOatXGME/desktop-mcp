@@ -64,7 +64,7 @@ use crate::{
     ipc::{Action, DesktopSnapshot, Include, MouseButton, Request, WindowInfo},
     keys::KeyMapper,
     render::FrameStore,
-    tracker::{PingState, Wait},
+    tracker::{PingKey, PingState, Wait},
 };
 
 pub struct DesktopState {
@@ -98,12 +98,15 @@ pub struct DesktopState {
     pub next_window_id: u64,
     pub focused_window: Option<u64>,
 
-    pub ping_states: HashMap<u64, PingState>,
+    pub ping_states: HashMap<PingKey, PingState>,
     pub waits: Vec<Wait>,
 
     pub xwayland_shell_state: XWaylandShellState,
     pub xwm: Option<X11Wm>,
     pub xdisplay: Option<u32>,
+    pub x11ping: Option<crate::x11ping::X11Ping>,
+    /// Cached `_NET_WM_PING` support per X11 client window.
+    pub x11_ping_support: HashMap<u32, bool>,
 }
 
 /// Tag stored in each Window's user data to identify it across the API.
@@ -218,6 +221,8 @@ impl DesktopState {
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
+            x11ping: None,
+            x11_ping_support: HashMap::new(),
         })
     }
 
@@ -272,6 +277,13 @@ impl DesktopState {
     fn cascade_position(&self) -> Point<i32, Logical> {
         let n = self.windows.len() as i32;
         (24 + 32 * (n % 16), 24 + 32 * (n % 16)).into()
+    }
+
+    /// Drop ping bookkeeping for a destroyed X11 window (X11 window ids may be
+    /// reused by the server).
+    fn forget_x11_ping(&mut self, window: u32) {
+        self.ping_states.remove(&PingKey::X11(window));
+        self.x11_ping_support.remove(&window);
     }
 
     /// Map any committed surface (toplevel, subsurface or popup) to the id of
@@ -728,19 +740,22 @@ impl DesktopState {
                         .and_then(|c| c.get_credentials(&self.display_handle).ok())
                         .map(|c| c.pid);
                     let frozen = shell_client_key(&toplevel.client())
-                        .map(|key| self.client_frozen(key))
+                        .map(|key| self.client_frozen(PingKey::Wayland(key)))
                         .unwrap_or(false);
                     (title, app_id, pid, frozen, false)
                 }
-                // X11 clients don't participate in xdg ping, so no freeze
-                // detection for them. The pid comes from _NET_WM_PID.
-                WindowSurface::X11(x) => (
-                    x.title(),
-                    x.class(),
-                    x.pid().map(|p| p as i32),
-                    false,
-                    true,
-                ),
+                // X11 windows are pinged via _NET_WM_PING when they support it
+                // (see tracker); the pid comes from _NET_WM_PID.
+                WindowSurface::X11(x) => {
+                    let frozen = self.client_frozen(PingKey::X11(x.window_id()));
+                    (
+                        x.title(),
+                        x.class(),
+                        x.pid().map(|p| p as i32),
+                        frozen,
+                        true,
+                    )
+                }
             };
             let is_new = known_at_start
                 .map(|known| !known.contains(&id))
@@ -1032,6 +1047,7 @@ impl XwmHandler for DesktopState {
                 tracing::info!(window = id, "X11 window unmapped");
             }
         }
+        self.forget_x11_ping(window.window_id());
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
         }
@@ -1043,6 +1059,7 @@ impl XwmHandler for DesktopState {
                 self.unregister_window(id);
             }
         }
+        self.forget_x11_ping(window.window_id());
     }
 
     fn configure_request(

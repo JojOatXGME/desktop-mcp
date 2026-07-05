@@ -11,6 +11,7 @@ mod mcp;
 mod monitor;
 mod render;
 mod tracker;
+mod x11ping;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -20,10 +21,10 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use smithay::reexports::calloop::{
-    channel,
+    self, channel,
     generic::Generic,
     timer::{TimeoutAction, Timer},
-    EventLoop, Interest, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction,
 };
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -309,8 +310,11 @@ fn run_server(
                         .context("event loop failed during XWayland startup")?;
                 }
                 match state.xdisplay {
-                    // SAFETY: no other threads are running yet.
-                    Some(n) => unsafe { std::env::set_var("DISPLAY", format!(":{n}")) },
+                    Some(n) => {
+                        // SAFETY: no other threads are running yet.
+                        unsafe { std::env::set_var("DISPLAY", format!(":{n}")) };
+                        setup_x11_ping(&handle, &mut state, n);
+                    }
                     None => tracing::warn!("XWayland did not become ready within 10s"),
                 }
             }
@@ -436,6 +440,41 @@ fn run_server(
 
     drop(a11y_buses);
     Ok(())
+}
+
+/// Open the passive `_NET_WM_PING` observer connection and feed its pong
+/// events into the tracker via calloop. Best effort: on failure, X11 windows
+/// simply keep the settle-grace fallback and are never marked frozen.
+fn setup_x11_ping(
+    handle: &LoopHandle<'static, DesktopState>,
+    state: &mut DesktopState,
+    display: u32,
+) {
+    let (ping, conn, scratch) = match x11ping::X11Ping::connect(display) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("X11 ping observer unavailable: {e}");
+            return;
+        }
+    };
+    let wakeup_atom = ping.wakeup_atom();
+    let source = smithay::utils::x11rb::X11Source::new(conn, scratch, wakeup_atom);
+    let res = handle.insert_source(source, |event, _, state| {
+        if let calloop::channel::Event::Msg(event) = event {
+            if let Some(ping) = state.x11ping.as_ref() {
+                if let Some((window, serial)) = ping.parse_pong(&event) {
+                    state.note_x11_pong(window, serial);
+                }
+            }
+        }
+    });
+    match res {
+        Ok(_) => {
+            state.x11ping = Some(ping);
+            tracing::info!("X11 _NET_WM_PING observer active");
+        }
+        Err(e) => tracing::warn!("failed to insert X11 ping source: {e}"),
+    }
 }
 
 fn report_failure(ready_pipe: Option<std::fs::File>, msg: &str) {

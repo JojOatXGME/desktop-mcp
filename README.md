@@ -94,8 +94,9 @@ timeout, default 3000, 0 = immediate), `watch_window` (only track this window
 and new windows), `screenshots`, `accessibility` (default true).
 
 Every result reports for each window: title, app id, geometry, `focused`,
-`changed`, `new`, `frozen` (client unresponsive to pings for >10 s), `x11`
-(window belongs to an X11 app running through XWayland), plus
+`changed`, `new`, `frozen` (client unresponsive to pings for >10 s — via
+xdg-shell for Wayland windows and `_NET_WM_PING` for X11 windows that support
+it), `x11` (window belongs to an X11 app running through XWayland), plus
 `closed_windows` and `timed_out` for the transition.
 
 X11 applications are supported transparently: XWayland is started

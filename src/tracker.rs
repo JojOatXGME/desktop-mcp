@@ -1,11 +1,16 @@
 //! Transition tracking: after an action is injected, wait until the UI has
 //! settled. A transition is considered complete once two consecutive
-//! ping-pong rounds to the relevant xdg clients passed without any surface
+//! ping-pong rounds to the relevant clients passed without any surface
 //! commits. Clients whose ping goes unanswered for more than 10 seconds are
 //! reported as frozen.
+//!
+//! Wayland clients are pinged through xdg-shell; XWayland windows through
+//! `_NET_WM_PING` (see [`crate::x11ping`]). Both feed the same bookkeeping,
+//! keyed by [`PingKey`].
 
 use std::{
     collections::HashSet,
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -20,14 +25,25 @@ use crate::{
 pub const FROZEN_AFTER: Duration = Duration::from_secs(10);
 /// How many quiet ping-pong rounds mark a transition as complete.
 const QUIET_ROUNDS: u32 = 2;
-/// Minimum quiet period for waits involving X11 windows, which can't be
-/// pinged. Long enough to catch a typical redraw after injected input.
+/// Minimum quiet period for waits involving X11 windows that cannot be pinged
+/// (they don't advertise `_NET_WM_PING`). Long enough to catch a typical
+/// redraw after injected input.
 const X11_SETTLE_GRACE: Duration = Duration::from_millis(400);
+
+/// Identifies a pingable client: a Wayland xdg shell client, or an XWayland
+/// client window pinged via `_NET_WM_PING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PingKey {
+    Wayland(u64),
+    X11(u32),
+}
+
+static X11_PING_SERIAL: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Debug)]
 pub struct PingState {
     /// Serial and send time of a ping that has not been answered yet.
-    pub outstanding: Option<(smithay::utils::Serial, Instant)>,
+    pub outstanding: Option<(u32, Instant)>,
     pub last_pong: Instant,
 }
 
@@ -39,9 +55,8 @@ pub struct Wait {
     pub changed: HashSet<u64>,
     pub closed: Vec<u64>,
     pub quiet_rounds: u32,
-    /// Shell-client keys the current ping round is waiting on; None = no
-    /// round in flight.
-    pub round: Option<Vec<u64>>,
+    /// Ping keys the current round is waiting on; None = no round in flight.
+    pub round: Option<Vec<PingKey>>,
     pub round_dirty: bool,
     /// Time-based settling (the `wait` tool): settled once this much time
     /// passed without updates. None = two-quiet-rounds rule.
@@ -116,9 +131,11 @@ impl DesktopState {
         }
     }
 
+    /// A Wayland xdg client answered our ping. The xdg pong carries no serial
+    /// we tracked, so any pong clears the outstanding ping (as before).
     pub fn note_pong(&mut self, key: u64) {
         let now = Instant::now();
-        let entry = self.ping_states.entry(key).or_insert(PingState {
+        let entry = self.ping_states.entry(PingKey::Wayland(key)).or_insert(PingState {
             outstanding: None,
             last_pong: now,
         });
@@ -127,7 +144,20 @@ impl DesktopState {
         self.evaluate_waits();
     }
 
-    pub fn client_frozen(&self, key: u64) -> bool {
+    /// An XWayland window answered a `_NET_WM_PING`. Only clears the ping if
+    /// the serial matches, so stale replies don't end a round early.
+    pub fn note_x11_pong(&mut self, window: u32, serial: u32) {
+        let now = Instant::now();
+        if let Some(entry) = self.ping_states.get_mut(&PingKey::X11(window)) {
+            if entry.outstanding.map(|(s, _)| s == serial).unwrap_or(false) {
+                entry.outstanding = None;
+                entry.last_pong = now;
+            }
+        }
+        self.evaluate_waits();
+    }
+
+    pub fn client_frozen(&self, key: PingKey) -> bool {
         self.ping_states
             .get(&key)
             .and_then(|p| p.outstanding)
@@ -161,22 +191,89 @@ impl DesktopState {
         clients
     }
 
-    /// Whether any window relevant to this wait is an X11 window. X11 clients
-    /// don't answer xdg pings, so the ping-round rule can complete before the
-    /// app has reacted; such waits get a minimum settle grace instead.
-    fn wait_involves_x11(&self, watch: Option<u64>, known_at_start: &HashSet<u64>) -> bool {
-        self.windows.iter().any(|(id, window)| {
-            let relevant = match watch {
-                None => true,
-                Some(watched) => *id == watched || !known_at_start.contains(id),
+    /// X11 client windows relevant for a wait that advertise `_NET_WM_PING`.
+    /// Support is queried once per window and cached.
+    fn wait_x11_targets(&mut self, watch: Option<u64>, known_at_start: &HashSet<u64>) -> Vec<u32> {
+        // Collect candidate (id, x11 window) pairs first to avoid holding a
+        // borrow of self.windows while mutating the support cache.
+        let candidates: Vec<u32> = self
+            .windows
+            .iter()
+            .filter_map(|(id, window)| {
+                let relevant = match watch {
+                    None => true,
+                    Some(watched) => *id == watched || !known_at_start.contains(id),
+                };
+                if !relevant {
+                    return None;
+                }
+                window.x11_surface().map(|s| s.window_id())
+            })
+            .collect();
+
+        let mut targets = Vec::new();
+        for win in candidates {
+            let supported = match self.x11_ping_support.get(&win) {
+                Some(&s) => s,
+                None => {
+                    let s = self
+                        .x11ping
+                        .as_ref()
+                        .map(|p| p.supports_ping(win))
+                        .unwrap_or(false);
+                    self.x11_ping_support.insert(win, s);
+                    s
+                }
             };
-            relevant && window.is_x11()
+            if supported {
+                targets.push(win);
+            }
+        }
+        targets
+    }
+
+    /// Whether any window relevant to this wait is an X11 window that we can't
+    /// ping (no `_NET_WM_PING`). Such waits fall back to a settle grace, since
+    /// the ping-round rule would otherwise complete before the app reacts.
+    fn wait_involves_unpingable_x11(
+        &mut self,
+        watch: Option<u64>,
+        known_at_start: &HashSet<u64>,
+    ) -> bool {
+        let candidates: Vec<u32> = self
+            .windows
+            .iter()
+            .filter_map(|(id, window)| {
+                let relevant = match watch {
+                    None => true,
+                    Some(watched) => *id == watched || !known_at_start.contains(id),
+                };
+                if !relevant {
+                    return None;
+                }
+                window.x11_surface().map(|s| s.window_id())
+            })
+            .collect();
+        candidates.into_iter().any(|win| {
+            let supported = match self.x11_ping_support.get(&win) {
+                Some(&s) => s,
+                None => {
+                    let s = self
+                        .x11ping
+                        .as_ref()
+                        .map(|p| p.supports_ping(win))
+                        .unwrap_or(false);
+                    self.x11_ping_support.insert(win, s);
+                    s
+                }
+            };
+            !supported
         })
     }
 
     /// Send a ping to the given shell client unless one is already in flight.
-    fn ensure_ping(&mut self, sc: &ShellClient) -> Option<u64> {
-        let key = shell_client_key(sc)?;
+    fn ensure_ping(&mut self, sc: &ShellClient) -> Option<PingKey> {
+        let key = PingKey::Wayland(shell_client_key(sc)?);
         let now = Instant::now();
         let entry = self.ping_states.entry(key).or_insert(PingState {
             outstanding: None,
@@ -187,9 +284,27 @@ impl DesktopState {
             // A failure is either a ping we already sent (keep waiting on the
             // existing entry) or a dead client (nothing to wait for).
             if sc.send_ping(serial).is_ok() {
-                entry.outstanding = Some((serial, now));
+                entry.outstanding = Some((u32::from(serial), now));
             } else if !sc.alive() {
                 return None;
+            }
+        }
+        Some(key)
+    }
+
+    /// Send a `_NET_WM_PING` to an X11 window unless one is already in flight.
+    fn ensure_x11_ping(&mut self, window: u32) -> Option<PingKey> {
+        let x11ping = self.x11ping.as_ref()?;
+        let now = Instant::now();
+        let key = PingKey::X11(window);
+        let entry = self.ping_states.entry(key).or_insert(PingState {
+            outstanding: None,
+            last_pong: now,
+        });
+        if entry.outstanding.is_none() {
+            let serial = X11_PING_SERIAL.fetch_add(1, Ordering::Relaxed);
+            if x11ping.send_ping(window, serial) {
+                entry.outstanding = Some((serial, now));
             }
         }
         Some(key)
@@ -213,6 +328,11 @@ impl DesktopState {
                         keys.push(key);
                     }
                 }
+                for win in self.wait_x11_targets(watch, &known) {
+                    if let Some(key) = self.ensure_x11_ping(win) {
+                        keys.push(key);
+                    }
+                }
                 let wait = &mut self.waits[i];
                 wait.round = Some(keys);
                 wait.round_dirty = false;
@@ -225,12 +345,17 @@ impl DesktopState {
     fn evaluate_waits(&mut self) {
         let now = Instant::now();
         let current_ids: HashSet<u64> = self.windows.keys().copied().collect();
-        // Precompute X11 involvement per wait (borrow of self ends before the
-        // mutable loop below).
-        let x11_involved: Vec<bool> = self
+        // Precompute, per wait, whether an X11 window that we cannot ping is
+        // involved — those fall back to a settle grace. (Borrow of self ends
+        // before the mutable loop below.)
+        let watch_known: Vec<(Option<u64>, HashSet<u64>)> = self
             .waits
             .iter()
-            .map(|w| self.wait_involves_x11(w.watch, &w.known_at_start))
+            .map(|w| (w.watch, w.known_at_start.clone()))
+            .collect();
+        let grace_needed: Vec<bool> = watch_known
+            .into_iter()
+            .map(|(watch, known)| self.wait_involves_unpingable_x11(watch, &known))
             .collect();
         let mut finished: Vec<(usize, bool)> = Vec::new();
         for (i, wait) in self.waits.iter_mut().enumerate() {
@@ -268,10 +393,11 @@ impl DesktopState {
                                 && wait.last_activity.elapsed() >= quiet_time
                         }
                     };
-                    // X11 windows can't be pinged, so give them a grace period
-                    // after the last update (or after the action, if they never
-                    // reacted) before considering the transition complete.
-                    let grace_ok = !x11_involved[i]
+                    // Unpingable X11 windows get a grace period after the last
+                    // update (or after the action, if they never reacted)
+                    // before the transition is considered complete. Pingable
+                    // windows rely on the ping-pong rounds above instead.
+                    let grace_ok = !grace_needed[i]
                         || wait.last_activity.elapsed() >= X11_SETTLE_GRACE;
                     if settled && grace_ok {
                         finished.push((i, false));
@@ -306,5 +432,8 @@ impl DesktopState {
             self.ensure_ping(sc);
         }
         let _ = self.display_handle.flush_clients();
+        for win in self.wait_x11_targets(None, &HashSet::new()) {
+            self.ensure_x11_ping(win);
+        }
     }
 }

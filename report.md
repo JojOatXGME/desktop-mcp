@@ -106,13 +106,33 @@ app_id = `WM_CLASS`, pid = `_NET_WM_PID`); each window carries an `x11: true`
 flag in its state.
 
 Two X11-specific behaviours differ from the Wayland path:
-- **No ping/freeze detection.** X11 clients don't participate in xdg ping, so
-  they are never marked `frozen`. To keep transition detection reliable, any
-  wait involving an X11 window uses a 400 ms settle grace (a quiet period
-  after the last commit) instead of relying on the two-quiet-ping-rounds rule,
-  which would otherwise complete before the app finishes redrawing.
+- **Ping/freeze via `_NET_WM_PING`.** X11 clients don't participate in xdg
+  ping, so a separate passive X11 connection pings them through the EWMH
+  `_NET_WM_PING` protocol (see the next paragraph and `src/x11ping.rs`).
+  Windows that advertise `_NET_WM_PING` (GTK/Qt/Java apps) get real ping-pong
+  convergence and freeze detection, exactly like Wayland windows. Windows that
+  don't (legacy Xaw/Motif apps such as `xterm`/`xcalc`) can't be pinged and so
+  are never marked `frozen`; for them, any wait uses a 400 ms settle grace (a
+  quiet period after the last commit) instead of the two-quiet-ping-rounds
+  rule, which would otherwise complete before the app finishes redrawing.
 - **PID for accessibility** is taken from `_NET_WM_PID` (the Wayland client
   credentials would report XWayland itself), so a11y correlation still works.
+
+**How `_NET_WM_PING` is wired up.** smithay's `X11Wm` owns the window-manager
+role but exposes no API to ping X11 clients or observe their pong replies
+(pongs land in an internal catch-all and are dropped). The compositor
+therefore opens a *second, passive* X11 connection to the same XWayland
+server. It never requests `SubstructureRedirect` (which only the real WM may
+hold, so there is no conflict with smithay); it only selects
+`SubstructureNotify` on the root window — which is where clients send their
+`_NET_WM_PING` replies — and sends `_NET_WM_PING` ClientMessages to client
+windows. The connection is integrated into the calloop loop through smithay's
+public `X11Source`; pong ClientMessages are matched by window id and serial
+and feed the same freeze/convergence bookkeeping as xdg pings (unified under a
+`PingKey::{Wayland,X11}` enum). Support is probed once per window via
+`WM_PROTOCOLS` and cached. This is best effort: if the observer connection
+can't be established, X11 windows silently fall back to the settle-grace
+behaviour.
 
 Environment requirements (documented in the README): the `Xwayland` binary
 and Mesa GL libraries (`libegl1`/`libgl1` — Xwayland aborts at startup without
